@@ -17,8 +17,14 @@ const GITHUB_REPO: &str = "washanhanzi/cargo-appraiser";
 
 /// Main extension struct
 struct CargoAppraiser {
-    /// Cached binary path for the current session
-    cached_binary_path: Option<String>,
+    /// Cached binary path and version for the current session
+    cached_binary: Option<CachedBinary>,
+}
+
+/// Cached binary information
+struct CachedBinary {
+    path: String,
+    version: Option<String>,
 }
 
 impl CargoAppraiser {
@@ -54,6 +60,18 @@ impl CargoAppraiser {
         }
     }
 
+    /// Check if a version string looks like an exact version (no operators)
+    fn is_exact_version(version_str: &str) -> bool {
+        let trimmed = version_str.trim();
+        // Check for semver operators that indicate a range
+        !trimmed.starts_with('^')
+            && !trimmed.starts_with('~')
+            && !trimmed.starts_with('>')
+            && !trimmed.starts_with('<')
+            && !trimmed.contains(',')
+            && !trimmed.contains(' ')
+    }
+
     /// Fetch the latest release using Zed's built-in GitHub API
     fn fetch_latest_release(&self) -> Result<zed::GithubRelease> {
         zed::latest_github_release(
@@ -72,21 +90,24 @@ impl CargoAppraiser {
 
     /// Find a release matching a semver version requirement
     fn find_compatible_release(&self, version_req_str: &str) -> Result<zed::GithubRelease> {
-        // First try to parse as an exact version (e.g., "=0.3.0" or "0.3.0")
-        let trimmed = version_req_str.trim_start_matches('=');
+        // Only try exact tag lookup for exact versions (no operators)
+        if Self::is_exact_version(version_req_str) {
+            let trimmed = version_req_str.trim_start_matches('=');
 
-        // Try fetching by exact tag first (faster if it exists)
-        if let Ok(release) = self.fetch_release_by_tag(&format!("v{}", trimmed)) {
-            return Ok(release);
-        }
-        if let Ok(release) = self.fetch_release_by_tag(trimmed) {
-            return Ok(release);
+            // Try fetching by exact tag (faster if it exists)
+            if let Ok(release) = self.fetch_release_by_tag(&format!("v{}", trimmed)) {
+                return Ok(release);
+            }
+            if let Ok(release) = self.fetch_release_by_tag(trimmed) {
+                return Ok(release);
+            }
         }
 
-        // If that doesn't work, fall back to latest and validate
+        // Parse the version requirement
         let version_req = semver::VersionReq::parse(version_req_str)
             .map_err(|e| format!("Invalid version requirement '{}': {}", version_req_str, e))?;
 
+        // Fetch latest and check if it matches
         let release = self.fetch_latest_release()?;
         let release_version = semver::Version::parse(&release.version).map_err(|e| {
             format!(
@@ -100,7 +121,7 @@ impl CargoAppraiser {
         } else {
             Err(format!(
                 "Latest version {} does not match requirement '{}'. \
-                 Consider updating the version requirement or removing it to use latest.",
+                Consider updating the version requirement or removing it to use latest.",
                 release.version, version_req_str
             ))
         }
@@ -147,8 +168,8 @@ impl CargoAppraiser {
             .find(|a| a.name == asset_name)
             .ok_or_else(|| {
                 format!(
-                    "No binary available for your platform (looking for '{}'). \n\
-                     Available assets: {:?}",
+                    "No binary available for your platform (looking for '{}').\n\
+                    Available assets: {:?}",
                     asset_name,
                     release.assets.iter().map(|a| &a.name).collect::<Vec<_>>()
                 )
@@ -175,8 +196,8 @@ impl CargoAppraiser {
             )
             .map_err(|e| {
                 format!(
-                    "Failed to download cargo-appraiser v{}: {}. \n\
-                     Please check your network connection and try again.",
+                    "Failed to download cargo-appraiser v{}: {}.\n\
+                    Please check your network connection and try again.",
                     release.version, e
                 )
             })?;
@@ -188,22 +209,31 @@ impl CargoAppraiser {
             self.cleanup_old_versions(&version_dir);
         }
 
-        // Cache the binary path
-        self.cached_binary_path = Some(binary_path.clone());
+        // Cache the binary path and version
+        self.cached_binary = Some(CachedBinary {
+            path: binary_path.clone(),
+            version: version.map(|s| s.to_string()),
+        });
 
         Ok(binary_path)
     }
 
-    /// Get the binary path, using cached value if available
+    /// Get the binary path, using cached value if available and version matches
     fn get_binary_path(
         &mut self,
         language_server_id: &LanguageServerId,
         version: Option<&str>,
     ) -> Result<String> {
-        // If we have a cached path that still exists, use it
-        if let Some(ref path) = self.cached_binary_path {
-            if fs::metadata(path).map_or(false, |m| m.is_file()) {
-                return Ok(path.clone());
+        // Check if we have a valid cached path for the requested version
+        if let Some(ref cached) = self.cached_binary {
+            let version_matches = match (&cached.version, version) {
+                (None, None) => true,
+                (Some(cached_v), Some(requested_v)) => cached_v == requested_v,
+                _ => false,
+            };
+
+            if version_matches && fs::metadata(&cached.path).map_or(false, |m| m.is_file()) {
+                return Ok(cached.path.clone());
             }
         }
 
@@ -215,7 +245,7 @@ impl CargoAppraiser {
 impl zed::Extension for CargoAppraiser {
     fn new() -> Self {
         Self {
-            cached_binary_path: None,
+            cached_binary: None,
         }
     }
 
@@ -242,13 +272,19 @@ impl zed::Extension for CargoAppraiser {
             self.get_binary_path(language_server_id, version)?
         };
 
-        // Build command arguments
-        // Default to inlayHint renderer which is recommended for Zed
+        // Build command arguments - default to inlayHint renderer for Zed
         let mut args = vec!["--renderer".to_string(), "inlayHint".to_string()];
 
         // Check for custom arguments from binary settings
         if let Some(custom_args) = settings.binary.as_ref().and_then(|b| b.arguments.as_ref()) {
-            args = custom_args.clone();
+            // If user specifies --renderer, use their args as full replacement
+            // Otherwise, append their args to defaults
+            let user_overrides_renderer = custom_args.iter().any(|arg| arg == "--renderer");
+            if user_overrides_renderer {
+                args = custom_args.clone();
+            } else {
+                args.extend(custom_args.iter().cloned());
+            }
         }
 
         Ok(zed::Command {

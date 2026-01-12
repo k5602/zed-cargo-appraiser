@@ -58,6 +58,8 @@ Use a locally built or custom binary:
 }
 ```
 
+> **Note**: Custom arguments are appended to defaults unless you specify `--renderer`, which triggers a full replacement.
+
 ### LSP Initialization Options
 
 Customize decorations and audit settings:
@@ -100,7 +102,7 @@ Customize decorations and audit settings:
 | `compatible_latest` | Can update to latest | `{{installed}}`, `{{latest}}` |
 | `noncompatible_latest` | Latest is incompatible | `{{installed}}`, `{{latest}}` |
 | `yanked` | Current version is yanked | `{{installed}}`, `{{latest_matched}}` |
-| `git` | Git dependency | `{{ref}}`, `{{commit}}` |
+| `git` | Git dependency | `{{commit}}` |
 
 ### Audit Options
 
