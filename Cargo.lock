@@ -748,7 +748,6 @@ dependencies = [
 name = "zed-cargo-appraiser"
 version = "0.1.0"
 dependencies = [
- "semver",
  "serde",
  "serde_json",
  "zed_extension_api",
