@@ -36,8 +36,8 @@ impl CargoAppraiser {
             "cargo-appraiser-{os}-{arch}{ext}",
             arch = match arch {
                 zed::Architecture::Aarch64 => "arm64",
-                // Note: 32-bit x86 binaries are not provided, but we map to amd64
-                // and let it fail gracefully when the binary is not found
+                // Note: 32-bit x86 binaries are not provided
+                // it will fail gracefully when the binary is not found
                 zed::Architecture::X86 => "x86",
                 zed::Architecture::X8664 => "amd64",
             },
@@ -170,7 +170,7 @@ impl CargoAppraiser {
         let binary_path = format!("{}/{}", version_dir, Self::get_binary_name());
 
         // Download if not already present
-        if !fs::metadata(&binary_path).map_or(false, |m| m.is_file()) {
+        if !fs::metadata(&binary_path).is_ok_and(|m| m.is_file()) {
             zed::set_language_server_installation_status(
                 language_server_id,
                 &zed::LanguageServerInstallationStatus::Downloading,
@@ -219,7 +219,7 @@ impl CargoAppraiser {
                 _ => false,
             };
 
-            if version_matches && fs::metadata(&cached.path).map_or(false, |m| m.is_file()) {
+            if version_matches && fs::metadata(&cached.path).is_ok_and(|m| m.is_file()) {
                 return Ok(cached.path.clone());
             }
         }
