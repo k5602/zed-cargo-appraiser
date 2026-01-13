@@ -38,7 +38,8 @@ impl CargoAppraiser {
                 zed::Architecture::Aarch64 => "arm64",
                 // Note: 32-bit x86 binaries are not provided, but we map to amd64
                 // and let it fail gracefully when the binary is not found
-                zed::Architecture::X86 | zed::Architecture::X8664 => "amd64",
+                zed::Architecture::X86 => "x86",
+                zed::Architecture::X8664 => "amd64",
             },
             os = match platform {
                 zed::Os::Mac => "darwin",
