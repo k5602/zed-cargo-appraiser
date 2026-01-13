@@ -36,6 +36,8 @@ impl CargoAppraiser {
             "cargo-appraiser-{os}-{arch}{ext}",
             arch = match arch {
                 zed::Architecture::Aarch64 => "arm64",
+                // Note: 32-bit x86 binaries are not provided, but we map to amd64
+                // and let it fail gracefully when the binary is not found
                 zed::Architecture::X86 | zed::Architecture::X8664 => "amd64",
             },
             os = match platform {
@@ -60,18 +62,6 @@ impl CargoAppraiser {
         }
     }
 
-    /// Check if a version string looks like an exact version (no operators)
-    fn is_exact_version(version_str: &str) -> bool {
-        let trimmed = version_str.trim();
-        // Check for semver operators that indicate a range
-        !trimmed.starts_with('^')
-            && !trimmed.starts_with('~')
-            && !trimmed.starts_with('>')
-            && !trimmed.starts_with('<')
-            && !trimmed.contains(',')
-            && !trimmed.contains(' ')
-    }
-
     /// Fetch the latest release using Zed's built-in GitHub API
     fn fetch_latest_release(&self) -> Result<zed::GithubRelease> {
         zed::latest_github_release(
@@ -83,48 +73,46 @@ impl CargoAppraiser {
         )
     }
 
-    /// Fetch a specific release by tag name
-    fn fetch_release_by_tag(&self, tag: &str) -> Result<zed::GithubRelease> {
-        zed::github_release_by_tag_name(GITHUB_REPO, tag)
-    }
+    /// Fetch a specific release by exact version string
+    ///
+    /// Only exact versions are supported (e.g., "0.3.0" or "=0.3.0").
+    /// Semver ranges like "^0.3.0" or ">=0.3.0" are not supported because
+    /// Zed's extension API does not provide paginated access to GitHub releases.
+    fn fetch_release_by_version(&self, version: &str) -> Result<zed::GithubRelease> {
+        // Check for semver range operators which we don't support
+        let has_range_operator = version.starts_with('^')
+            || version.starts_with('~')
+            || version.starts_with('>')
+            || version.starts_with('<')
+            || version.contains(',')
+            || version.contains(' ');
 
-    /// Find a release matching a semver version requirement
-    fn find_compatible_release(&self, version_req_str: &str) -> Result<zed::GithubRelease> {
-        // Only try exact tag lookup for exact versions (no operators)
-        if Self::is_exact_version(version_req_str) {
-            let trimmed = version_req_str.trim_start_matches('=');
-
-            // Try fetching by exact tag (faster if it exists)
-            if let Ok(release) = self.fetch_release_by_tag(&format!("v{}", trimmed)) {
-                return Ok(release);
-            }
-            if let Ok(release) = self.fetch_release_by_tag(trimmed) {
-                return Ok(release);
-            }
+        if has_range_operator {
+            return Err(format!(
+                "Semver ranges like '{}' are not supported.\n\
+                Please specify an exact version (e.g., \"0.3.0\") or \
+                remove the version setting to use the latest release.",
+                version
+            ));
         }
 
-        // Parse the version requirement
-        let version_req = semver::VersionReq::parse(version_req_str)
-            .map_err(|e| format!("Invalid version requirement '{}': {}", version_req_str, e))?;
+        // Normalize: strip leading 'v' or '=' if present, user can write "1.0.5", "v1.0.5", or "=1.0.5"
+        let version = version
+            .trim()
+            .trim_start_matches('v')
+            .trim_start_matches('=');
 
-        // Fetch latest and check if it matches
-        let release = self.fetch_latest_release()?;
-        let release_version = semver::Version::parse(&release.version).map_err(|e| {
+        // Upstream uses consistent v-prefixed tags (e.g., v1.0.5, v0.3.2)
+        let tag = format!("v{}", version);
+
+        zed::github_release_by_tag_name(GITHUB_REPO, &tag).map_err(|_| {
             format!(
-                "Failed to parse release version '{}': {}",
-                release.version, e
+                "Version '{}' not found.\n\
+                Please check available releases at:\n\
+                https://github.com/{}/releases",
+                version, GITHUB_REPO
             )
-        })?;
-
-        if version_req.matches(&release_version) {
-            Ok(release)
-        } else {
-            Err(format!(
-                "Latest version {} does not match requirement '{}'. \
-                Consider updating the version requirement or removing it to use latest.",
-                release.version, version_req_str
-            ))
-        }
+        })
     }
 
     /// Clean up old version directories, keeping only the specified one
@@ -133,7 +121,6 @@ impl CargoAppraiser {
             for entry in entries.flatten() {
                 let name = entry.file_name();
                 if let Some(name_str) = name.to_str() {
-                    // Only remove cargo-appraiser-* directories that aren't the current version
                     if name_str.starts_with("cargo-appraiser-") && name_str != keep_version_dir {
                         let _ = fs::remove_dir_all(entry.path());
                     }
@@ -148,7 +135,6 @@ impl CargoAppraiser {
         language_server_id: &LanguageServerId,
         version: Option<&str>,
     ) -> Result<String> {
-        // Set status to checking for updates
         zed::set_language_server_installation_status(
             language_server_id,
             &zed::LanguageServerInstallationStatus::CheckingForUpdate,
@@ -156,7 +142,7 @@ impl CargoAppraiser {
 
         // Fetch the appropriate release
         let release = match version {
-            Some(v) => self.find_compatible_release(v)?,
+            Some(v) => self.fetch_release_by_version(v)?,
             None => self.fetch_latest_release()?,
         };
 
@@ -237,7 +223,6 @@ impl CargoAppraiser {
             }
         }
 
-        // Otherwise, install/download the binary
         self.install_binary(language_server_id, version)
     }
 }
@@ -259,10 +244,8 @@ impl zed::Extension for CargoAppraiser {
         // Determine the binary path
         let path = if let Some(binary_path) = settings.binary.as_ref().and_then(|b| b.path.as_ref())
         {
-            // User specified a custom binary path
             binary_path.clone()
         } else {
-            // Get version from settings, if specified
             let version = settings
                 .settings
                 .as_ref()
@@ -279,8 +262,7 @@ impl zed::Extension for CargoAppraiser {
         if let Some(custom_args) = settings.binary.as_ref().and_then(|b| b.arguments.as_ref()) {
             // If user specifies --renderer, use their args as full replacement
             // Otherwise, append their args to defaults
-            let user_overrides_renderer = custom_args.iter().any(|arg| arg == "--renderer");
-            if user_overrides_renderer {
+            if custom_args.iter().any(|arg| arg == "--renderer") {
                 args = custom_args.clone();
             } else {
                 args.extend(custom_args.iter().cloned());
